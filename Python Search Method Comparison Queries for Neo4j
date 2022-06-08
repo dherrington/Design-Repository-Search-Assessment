@@ -1,0 +1,637 @@
+SEARCH CODE – BEST COMPLETE MATCH
+
+#Import Packages
+from IPython.display import Image
+import requests
+import time
+import random
+import numpy as np
+import plotly
+import plotly.graph_objects as go
+import plotly.offline as offline
+import pandas
+from pandas import DataFrame
+from IPython.display import IFrame
+from neo4j import GraphDatabase
+
+total_tic = time.time()
+
+class Neo4jConnection:
+
+    def __init__(self, uri, user, pwd):
+        self.__uri = uri
+        self.__user = user
+        self.__pwd = pwd
+        self.__driver = None
+        try:
+            self.__driver = GraphDatabase.driver("bolt://localhost:7687", auth=("neo4j", "1234567890"), encrypted = False)
+        except Exception as e:
+            print("Failed to create the driver:", e)
+
+    def close(self):
+        if self.__driver is not None:
+            self.__driver.close()
+
+    def query(self, query, db=None):
+        assert self.__driver is not None, "Driver not initialized!"
+        session = None
+        response = None
+        try:
+            session = self.__driver.session(database=db) if db is not None else self.__driver.session()
+            response = list(session.run(query))
+        except Exception as e:
+            print("Query failed:", e)
+        finally:
+            if session is not None:
+                session.close()
+        return response
+
+conn = Neo4jConnection(uri="bolt://localhost:7687",user="python",pwd="12345678")
+
+query_string = '''
+    MATCH (s:System)<-[* {sys_assoc:s.name}]-(x:Artifact)
+    WITH distinct s.name AS SYS_NAME, x.name AS ENTITY_NAME
+    ORDER BY SYS_NAME, ENTITY_NAME
+    RETURN SYS_NAME, ENTITY_NAME
+'''
+
+dtf_data = DataFrame([dict(_) for _ in conn.query(query_string, db='neo4j')])
+#Full system:entity pairing pulled from neo4j, and stored as a Pandas dataframe
+
+conn.close()
+
+#Build list of random nodes.  NOTE: choosing a random node doesn't rule out matches due to luck of the draw
+node_list = dtf_data['ENTITY_NAME'].astype('str').unique()
+distinct_nodes = node_list.size
+
+def basic_search_test(num_loops = 1, num_nodes = 2, debug_mode = False, data_accuracy = 100):
+
+    total_looptime = 0
+    start_time = time.time()*1000
+    loop_count = num_loops
+    node_count = num_nodes #must be 1 or greater
+
+    #Reset Result Counter
+    Success = 0
+    Inconclusive = 0
+    Data_Issue = 0
+    Failure = 0
+    No_Match = 0
+
+    #Reopen Connection to neo4j
+    conn = Neo4jConnection(uri="bolt://localhost:7687",user="python",pwd="12345678")
+
+    for y in range(loop_count):
+        tic = time.time()*1000
+        neo4jtime = 0
+
+        #Randomize which CORRECT nodes are selected for each system, order determines selection
+        rand_array = DataFrame(np.random.rand(dtf_data.size))
+        dtf_data['randOrder']= rand_array
+        dtf_data['rank']=dtf_data.groupby("SYS_NAME")["randOrder"].rank("dense",ascending=False)
+        dtf_data.sort_values(by=['SYS_NAME','rank'])
+
+        #Generate new matrix of systems and entities (entities in random order)
+        search_matrix = dtf_data.pivot(index='SYS_NAME', columns='rank', values='ENTITY_NAME').fillna(axis=1,method='ffill')
+
+        neo4jtime = 0
+
+        #Query Loop for Current Search Matrix
+        for row in search_matrix.itertuples():
+            if str(row[node_count])=="nan":
+                result = 'Incomplete dataset (nan)'
+            else:
+                query_string = ''
+                query_string = query_string + 'MATCH (t_sys:System)<-[* ]-(x1 {sys_assoc:t_sys.name})'
+
+                for x in range(node_count-1):
+                    query_string = query_string + 'MATCH (t_sys)<-[* ]-(x' + str(x+2) + ' {sys_assoc:t_sys.name})'
+
+                if random.random()*100 <= data_accuracy:
+                    query_string = query_string + "WHERE x1.name = '" + row[1] + "' "
+                else:
+                    query_string = query_string + "WHERE x1.name = '" + node_list[int(random.random()*distinct_nodes)] + "' "
+
+                for x in range(node_count-1):
+                    if random.random()*100 <= data_accuracy:
+                        query_string = query_string + ' AND x' + str(x+2) + ".name = '" + row[x+2] + "' "
+                    else:
+                        query_string = query_string + ' AND x' + str(x+2) + ".name = '" + node_list[int(random.random()*distinct_nodes)] + "' "
+
+                query_string = query_string + '''
+                WITH COLLECT(distinct t_sys) AS matches, COUNT(DISTINCT t_sys.name) as total
+                UNWIND matches as match_list
+                WITH total, match_list.name AS sys_name
+                LIMIT 1
+                RETURN sys_name
+                '''
+
+                # Alternate method, only returning a system if we're certain (substitute for after RETURN):
+                # CASE (total = 1)
+                # WHEN TRUE THEN sys_name
+                # WHEN FALSE THEN 'Inconclusive'
+                # END AS result
+                # '''
+
+
+                tic2 = time.time()*1000
+                result_raw = str(conn.query(query_string, db='neo4j'))
+                toc2 = time.time()*1000
+                neo4jtime += (toc2 - tic2)
+                result = result_raw[19:-3]
+
+            if result == 'Inconclusive':
+                Inconclusive += 1
+            elif result == 'Incomplete dataset (nan)':
+                Data_Issue += 1
+            elif result_raw == '[]':
+                No_Match += 1
+            elif result == str(row[0]):
+                Success +=1
+            else:
+                Failure +=1
+
+        toc = time.time()*1000
+        looptime = (toc-tic)
+        total_looptime += looptime
+        if debug_mode:
+            print("Loop:" + str(y) +" Neo4j:" + str(int(neo4jtime)) + "ms Other:" + str(int(looptime-neo4jtime)) +"ms")
+
+    conn.close()
+
+    if debug_mode:
+        print("Success = " + str(Success / loop_count))
+        print("Failure = " + str(Failure / loop_count))
+        print("Inconclusive = " + str(Inconclusive / loop_count))
+        print("No Match = " + str(No_Match / loop_count))
+        print("Data Issues = " + str(Data_Issue / loop_count))
+        print((Success + Failure + Inconclusive + Data_Issue) / loop_count)
+        end_time = time.time()*1000
+        print("Total time: " + str(end_time-start_time) + "ms")
+        print("Loop time: "  + str(total_looptime)      + "ms")
+
+    return[num_nodes, data_accuracy, Success / loop_count, Failure / loop_count, Inconclusive / loop_count, No_Match / loop_count, Data_Issue / loop_count]
+
+temp_results = basic_search_test(num_loops = 1, num_nodes = 5, data_accuracy = 100)
+
+buckets = 21 # = (100 / data_acc stepsize) + 1
+tic = time.time()
+
+column_names = ["num_nodes","data_acc","success","failure","inconclusive","no_match","data_issue"]
+basic_results = DataFrame(columns = column_names)
+
+for y in range(1,8):
+    for x in range(buckets):
+        time.sleep(.5)
+        query_results = pandas.Series(basic_search_test(num_loops = 5, num_nodes = y, data_accuracy = x*(100/(buckets-1))),index=basic_results.columns)
+        basic_results = basic_results.append(query_results, ignore_index = True)
+    print("Done with "+str(y)+" nodes.  Took " + str(time.time()-tic) + "seconds")
+
+basic_results
+
+temp = basic_results
+
+success_data = temp.pivot(index='data_acc', columns='num_nodes', values='success') #Can change value charted here
+
+fig = go.Figure()
+
+x_data = list(success_data.index)
+
+for i in range(success_data.shape[1]):
+    y_data = list(success_data.iloc[:,i])
+    fig.add_trace(go.Scatter(x = x_data,y = y_data,
+                    mode='lines+markers',
+                    name= (str(int(success_data.columns[i])) + " nodes")))
+
+fig.update_layout(title='Search Success by Node Count',
+                   xaxis_title='Data Accuracy',
+                   yaxis_title='System Count')
+fig.show()
+
+ 
+SEARCH CODE – SET BASED COMPARISON
+
+#Import Packages
+from IPython.display import Image
+import requests
+import time
+import random
+import numpy as np
+import plotly
+import plotly.graph_objects as go
+import plotly.offline as offline
+import pandas
+from pandas import DataFrame
+from IPython.display import IFrame
+from neo4j import GraphDatabase
+
+total_tic = time.time()
+
+class Neo4jConnection:
+
+    def __init__(self, uri, user, pwd):
+        self.__uri = uri
+        self.__user = user
+        self.__pwd = pwd
+        self.__driver = None
+        try:
+            self.__driver = GraphDatabase.driver("bolt://localhost:7687", auth=("neo4j", "1234567890"), encrypted = False)
+        except Exception as e:
+            print("Failed to create the driver:", e)
+
+    def close(self):
+        if self.__driver is not None:
+            self.__driver.close()
+
+    def query(self, query, db=None):
+        assert self.__driver is not None, "Driver not initialized!"
+        session = None
+        response = None
+        try:
+            session = self.__driver.session(database=db) if db is not None else self.__driver.session()
+            response = list(session.run(query))
+        except Exception as e:
+            print("Query failed:", e)
+        finally:
+            if session is not None:
+                session.close()
+        return response
+
+
+
+conn = Neo4jConnection(uri="bolt://localhost:7687",user="python",pwd="12345678")
+
+query_string = '''
+    MATCH (s:System)<-[* {sys_assoc:s.name}]-(x:Artifact)
+    WITH distinct s.name AS SYS_NAME, x.name AS ENTITY_NAME
+    ORDER BY SYS_NAME, ENTITY_NAME
+    RETURN SYS_NAME, ENTITY_NAME
+'''
+
+dtf_data = DataFrame([dict(_) for _ in conn.query(query_string, db='neo4j')])
+#Full system:entity pairing pulled from neo4j, and stored as a Pandas dataframe
+
+conn.close()
+
+#Build list of random nodes.  NOTE: choosing a random node doesn't rule out matches due to luck of the draw
+node_list = dtf_data['ENTITY_NAME'].astype('str').unique()
+distinct_nodes = node_list.size
+
+def basic_search_test(num_loops = 1, num_nodes = 2, debug_mode = False, data_accuracy = 100):
+
+    total_looptime = 0
+    start_time = time.time()*1000
+    loop_count = num_loops
+    node_count = num_nodes #must be 1 or greater
+
+    #Reset Result Counter
+    Success = 0
+    Inconclusive = 0
+    Data_Issue = 0
+    Failure = 0
+    No_Match = 0
+
+    #Reopen Connection to neo4j
+    conn = Neo4jConnection(uri="bolt://localhost:7687",user="python",pwd="12345678")
+
+    for y in range(loop_count):
+        tic = time.time()*1000
+        neo4jtime = 0
+
+        #Randomize which CORRECT nodes are selected for each system, order determines selection
+        rand_array = DataFrame(np.random.rand(dtf_data.size))
+        dtf_data['randOrder']= rand_array
+        dtf_data['rank']=dtf_data.groupby("SYS_NAME")["randOrder"].rank("dense",ascending=False)
+        dtf_data.sort_values(by=['SYS_NAME','rank'])
+
+        #Generate new matrix of systems and entities (entities in random order)
+        search_matrix = dtf_data.pivot(index='SYS_NAME', columns='rank', values='ENTITY_NAME').fillna(axis=1,method='ffill')
+
+        neo4jtime = 0
+
+        #Query Loop for Current Search Matrix
+        for row in search_matrix.itertuples():
+            if str(row[node_count])=="nan":
+                result = 'Incomplete dataset (nan)'
+            else:
+                query_string = ''
+                query_string = query_string + "MATCH (x1:Artifact) WHERE x1.name in ['"
+
+                if random.random()*100 <= data_accuracy:
+                    query_string = query_string + row[1]
+                else:
+                    query_string = query_string + node_list[int(random.random()*distinct_nodes)]
+
+
+
+                for x in range(node_count-1):
+                    if random.random()*100 <= data_accuracy:
+                        query_string = query_string + "','" + row[x+2]
+                    else:
+                        query_string = query_string + "','" + node_list[int(random.random()*distinct_nodes)]
+
+                query_string = query_string + "']"
+
+                query_string = query_string + '''
+                WITH DISTINCT x1 as art_list
+                MATCH (sys:System)<-[:CHILD_OF*]-(art_list)
+                WITH DISTINCT sys as sys, art_list as art
+                WITH sys.name as sys, sum(art.node_score) / sys.system_score as system_score order by system_score desc limit 1
+                RETURN sys as sys_name
+                '''
+
+                # Alternate method, only returning a system if we're certain (substitute for after RETURN):
+                # CASE (total = 1)
+                # WHEN TRUE THEN sys_name
+                # WHEN FALSE THEN 'Inconclusive'
+                # END AS result
+                # '''
+
+
+                tic2 = time.time()*1000
+                result_raw = str(conn.query(query_string, db='neo4j'))
+                toc2 = time.time()*1000
+                neo4jtime += (toc2 - tic2)
+                result = result_raw[19:-3]
+
+
+            if result == 'Inconclusive':
+                Inconclusive += 1
+            elif result == 'Incomplete dataset (nan)':
+                Data_Issue += 1
+            elif result_raw == '[]':
+                No_Match += 1
+            elif result == str(row[0]):
+                Success +=1
+            else:
+                Failure +=1
+
+        toc = time.time()*1000
+        looptime = (toc-tic)
+        total_looptime += looptime
+        if debug_mode:
+            print("Loop:" + str(y) +" Neo4j:" + str(int(neo4jtime)) + "ms Other:" + str(int(looptime-neo4jtime)) +"ms")
+
+    conn.close()
+
+    if debug_mode:
+        print("Success = " + str(Success / loop_count))
+        print("Failure = " + str(Failure / loop_count))
+        print("Inconclusive = " + str(Inconclusive / loop_count))
+        print("No Match = " + str(No_Match / loop_count))
+        print("Data Issues = " + str(Data_Issue / loop_count))
+        print((Success + Failure + Inconclusive + Data_Issue) / loop_count)
+        end_time = time.time()*1000
+        print("Total time: " + str(end_time-start_time) + "ms")
+        print("Loop time: "  + str(total_looptime)      + "ms")
+
+    return[num_nodes, data_accuracy, Success / loop_count, Failure / loop_count, Inconclusive / loop_count, No_Match / loop_count, Data_Issue / loop_count]
+
+    buckets = 21 # = (100 / data_acc stepsize) + 1
+    tic = time.time()
+
+    column_names = ["num_nodes","data_acc","success","failure","inconclusive","no_match","data_issue"]
+    basic_results = DataFrame(columns = column_names)
+
+for y in range(1,8):
+    for x in range(buckets):
+        time.sleep(.5)
+        query_results = pandas.Series(basic_search_test(num_loops = 10, num_nodes = y, data_accuracy = x*(100/(buckets-1))),index=basic_results.columns)
+        basic_results = basic_results.append(query_results, ignore_index = True)
+        print(str(y)+"|"+str(x))
+    print("Done with "+str(y)+" nodes.  Took " + str(time.time()-tic) + "seconds")
+
+basic_results
+
+temp = basic_results
+
+success_data = temp.pivot(index='data_acc', columns='num_nodes', values='success') #Can change value charted here
+
+fig = go.Figure()
+
+x_data = list(success_data.index)
+
+for i in range(success_data.shape[1]):
+    y_data = list(success_data.iloc[:,i])
+    fig.add_trace(go.Scatter(x = x_data,y = y_data,
+                    mode='lines+markers',
+                    name= (str(int(success_data.columns[i])) + " nodes")))
+
+fig.update_layout(title='Search Success by Node Count',
+                   xaxis_title='Data Accuracy',
+                   yaxis_title='System Count')
+
+
+fig.show()
+
+
+ 
+SEARCH CODE – JACCARD MATCH
+
+#Import Packages
+from IPython.display import Image
+import requests
+import time
+import random
+import numpy as np
+import plotly
+import plotly.graph_objects as go
+import plotly.offline as offline
+import pandas
+from pandas import DataFrame
+from IPython.display import IFrame
+from neo4j import GraphDatabase
+
+total_tic = time.time()
+
+class Neo4jConnection:
+
+    def __init__(self, uri, user, pwd):
+        self.__uri = uri
+        self.__user = user
+        self.__pwd = pwd
+        self.__driver = None
+        try:
+            self.__driver = GraphDatabase.driver("bolt://localhost:7687", auth=("neo4j", "1234567890"), encrypted = False)
+        except Exception as e:
+            print("Failed to create the driver:", e)
+
+    def close(self):
+        if self.__driver is not None:
+            self.__driver.close()
+
+    def query(self, query, db=None):
+        assert self.__driver is not None, "Driver not initialized!"
+        session = None
+        response = None
+        try:
+            session = self.__driver.session(database=db) if db is not None else self.__driver.session()
+            response = list(session.run(query))
+        except Exception as e:
+            print("Query failed:", e)
+        finally:
+            if session is not None:
+                session.close()
+        return response
+
+
+
+conn = Neo4jConnection(uri="bolt://localhost:7687",user="python",pwd="12345678")
+
+query_string = '''
+    MATCH (s:System)<-[* {sys_assoc:s.name}]-(x:Artifact)
+    WITH distinct s.name AS SYS_NAME, x.name AS ENTITY_NAME
+    ORDER BY SYS_NAME, ENTITY_NAME
+    RETURN SYS_NAME, ENTITY_NAME
+'''
+
+dtf_data = DataFrame([dict(_) for _ in conn.query(query_string, db='neo4j')])
+#Full system:entity pairing pulled from neo4j, and stored as a Pandas dataframe
+
+conn.close()
+
+#Build list of random nodes.  NOTE: choosing a random node doesn't rule out matches due to luck of the draw
+node_list = dtf_data['ENTITY_NAME'].astype('str').unique()
+distinct_nodes = node_list.size
+
+def basic_search_test(num_loops = 1, num_nodes = 2, debug_mode = False, data_accuracy = 100):
+
+    total_looptime = 0
+    start_time = time.time()*1000
+    loop_count = num_loops
+    node_count = num_nodes #must be 1 or greater
+
+    #Reset Result Counter
+    Success = 0
+    Inconclusive = 0
+    Data_Issue = 0
+    Failure = 0
+    No_Match = 0
+
+    #Reopen Connection to neo4j
+    conn = Neo4jConnection(uri="bolt://localhost:7687",user="python",pwd="12345678")
+
+    for y in range(loop_count):
+        tic = time.time()*1000
+        neo4jtime = 0
+
+        #Randomize which CORRECT nodes are selected for each system, order determines selection
+        rand_array = DataFrame(np.random.rand(dtf_data.size))
+        dtf_data['randOrder']= rand_array
+        dtf_data['rank']=dtf_data.groupby("SYS_NAME")["randOrder"].rank("dense",ascending=False)
+        dtf_data.sort_values(by=['SYS_NAME','rank'])
+
+        #Generate new matrix of systems and entities (entities in random order)
+        search_matrix = dtf_data.pivot(index='SYS_NAME', columns='rank', values='ENTITY_ID').fillna(axis=1,method='ffill')
+
+        neo4jtime = 0
+
+        #Query Loop for Current Search Matrix
+        for row in search_matrix.itertuples():
+
+            sample_nodes = []
+
+            for x in range(node_count):
+                if random.random()*100 <= data_accuracy:
+                    sample_nodes.append(int(row[x+1]))
+                else:
+                    sample_nodes.append(int(node_list[int(random.random()*distinct_nodes)]))
+
+
+#           print(sample_nodes)
+
+            query_string = '''
+            MATCH (s:System)<-[:CHILD_OF *]-(a:Artifact)
+            WITH s.name as system_name, collect(id(a)) as s_artifacts, (''' + \
+            str(sample_nodes) + \
+            ''') as sample_nodes
+            WITH
+            system_name,
+            gds.alpha.similarity.jaccard(s_artifacts,sample_nodes) AS jaccard_similarity
+            ORDER BY jaccard_similarity DESC
+            RETURN system_name limit 1
+
+            '''
+
+            tic2 = time.time()*1000
+
+           # print(query_string)
+
+            result_raw = str(conn.query(query_string, db='neo4j'))
+
+            toc2 = time.time()*1000
+            neo4jtime += (toc2 - tic2)
+
+            result = result_raw[22:-3]
+
+            #print('result=' +result)
+            #print('result_raw=' +result_raw)
+
+            if result == 'Inconclusive':
+                Inconclusive += 1
+            elif result == 'Incomplete dataset (nan)':
+                Data_Issue += 1
+            elif result_raw == '[]':
+                No_Match += 1
+            elif result == str(row[0]):
+                Success +=1
+            else:
+                Failure +=1
+
+        toc = time.time()*1000
+        looptime = (toc-tic)
+        total_looptime += looptime
+        if debug_mode:
+            print("Loop:" + str(y) +" Neo4j:" + str(int(neo4jtime)) + "ms Other:" + str(int(looptime-neo4jtime)) +"ms")
+
+    conn.close()
+
+    if debug_mode:
+        print("Success = " + str(Success / loop_count))
+        print("Failure = " + str(Failure / loop_count))
+        print("Inconclusive = " + str(Inconclusive / loop_count))
+        print("No Match = " + str(No_Match / loop_count))
+        print("Data Issues = " + str(Data_Issue / loop_count))
+        print((Success + Failure + Inconclusive + Data_Issue) / loop_count)
+        end_time = time.time()*1000
+        print("Total time: " + str(end_time-start_time) + "ms")
+        print("Loop time: "  + str(total_looptime)      + "ms")
+
+    return[num_nodes, data_accuracy, Success / loop_count, Failure / loop_count, Inconclusive / loop_count, No_Match / loop_count, Data_Issue / loop_count]
+
+buckets = 21 # = (100 / data_acc stepsize) + 1
+tic = time.time()
+
+column_names = ["num_nodes","data_acc","success","failure","inconclusive","no_match","data_issue"]
+basic_results = DataFrame(columns = column_names)
+
+for y in range(1,8):
+    for x in range(buckets):
+        time.sleep(.5)
+        query_results = pandas.Series(basic_search_test(num_loops = 10, num_nodes = y, data_accuracy = x*(100/(buckets-1))),index=basic_results.columns)
+        basic_results = basic_results.append(query_results, ignore_index = True)
+        print(str(y)+"|"+str(x))
+    print("Done with "+str(y)+" nodes.  Took " + str(time.time()-tic) + "seconds")
+
+basic_results
+
+temp = basic_results
+
+success_data = temp.pivot(index='data_acc', columns='num_nodes', values='success') #Can change value charted here
+
+fig = go.Figure()
+
+x_data = list(success_data.index)
+
+for i in range(success_data.shape[1]):
+    y_data = list(success_data.iloc[:,i])
+    fig.add_trace(go.Scatter(x = x_data,y = y_data,
+                    mode='lines+markers',
+                    name= (str(int(success_data.columns[i])) + " nodes")))
+
+fig.update_layout(title='Search Success by Node Count',
+                   xaxis_title='Data Accuracy',
+                   yaxis_title='System Count')
+
+
+fig.show()
